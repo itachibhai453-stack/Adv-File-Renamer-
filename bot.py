@@ -6,9 +6,9 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
-from PIL import Image
 
 from config import Config
+from database import db
 
 bot = Client(
     "RenamerBot",
@@ -17,8 +17,8 @@ bot = Client(
     bot_token=Config.BOT_TOKEN
 )
 
-# In-memory storage for user states
-USER_DATA = {}
+# Temporary session data for active processes
+TEMP_DATA = {}
 
 os.makedirs(Config.DOWNLOAD_LOCATION, exist_ok=True)
 os.makedirs("./THUMBS", exist_ok=True)
@@ -54,13 +54,14 @@ def get_media_duration(file_path):
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command(client: Client, message: Message):
     user_id = message.from_user.id
-    USER_DATA.setdefault(user_id, {"upload_mode": "video", "metadata": "Renamed By Advanced Bot"})
-    
+    if not await db.is_user_exist(user_id):
+        await db.add_user(user_id)
+        
     welcome_text = (
         f"👋 Hi **{message.from_user.first_name}**!\n\n"
         "I am an **Advanced File Renamer Bot** with extra features:\n"
         "• Rename Files & Media\n"
-        "• Custom Thumbnail Support\n"
+        "• Custom Thumbnail Support (Saved in MongoDB)\n"
         "• Change Upload Mode (Video / Document)\n"
         "• Extract Audio/Subtitle Streams\n"
         "• Remove Audio/Subtitle Streams\n"
@@ -82,10 +83,10 @@ async def settings_command(client: Client, message: Message):
 
 async def show_settings(message_or_query):
     user_id = message_or_query.from_user.id if isinstance(message_or_query, Message) else message_or_query.from_user.id
-    USER_DATA.setdefault(user_id, {"upload_mode": "video", "metadata": "Renamed By Advanced Bot"})
+    user_data = await db.get_user_data(user_id)
     
-    mode = USER_DATA[user_id]["upload_mode"].capitalize()
-    meta = USER_DATA[user_id]["metadata"]
+    mode = user_data.get("upload_mode", "video").capitalize()
+    meta = user_data.get("metadata", "Renamed By Advanced Bot")
     
     text = (
         "⚙️ **Bot Settings**\n\n"
@@ -103,26 +104,24 @@ async def show_settings(message_or_query):
     else:
         await message_or_query.message.edit_text(text, reply_markup=buttons)
 
-# --- THUMBNAIL MANAGEMENT ---
+# --- THUMBNAIL MANAGEMENT (MONGODB) ---
 
 @bot.on_message(filters.photo & filters.private)
 async def save_thumbnail(client: Client, message: Message):
     user_id = message.from_user.id
-    thumb_path = f"./THUMBS/{user_id}.jpg"
-    await message.download(file_name=thumb_path)
-    await message.reply_text("✅ **Custom Thumbnail Saved Successfully!**")
+    file_id = message.photo.file_id
+    await db.set_thumbnail(user_id, file_id)
+    await message.reply_text("✅ **Custom Thumbnail Saved to Database!**")
 
 # --- MAIN MEDIA HANDLER ---
 
 @bot.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def handle_media(client: Client, message: Message):
     user_id = message.from_user.id
-    USER_DATA.setdefault(user_id, {"upload_mode": "video", "metadata": "Renamed By Advanced Bot"})
+    TEMP_DATA[user_id] = {"current_file": message}
     
     file = message.document or message.video or message.audio
     filename = file.file_name if hasattr(file, "file_name") and file.file_name else "Unknown_File"
-    
-    USER_DATA[user_id]["current_file"] = message
     
     text = f"📂 **File Received:** `{filename}`\n\nChoose an action below:"
     
@@ -141,51 +140,49 @@ async def handle_media(client: Client, message: Message):
 async def callback_handler(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
     data = query.data
-    USER_DATA.setdefault(user_id, {"upload_mode": "video", "metadata": "Renamed By Advanced Bot"})
 
     if data == "settings_menu":
         await show_settings(query)
         
     elif data == "toggle_mode":
-        current = USER_DATA[user_id]["upload_mode"]
-        USER_DATA[user_id]["upload_mode"] = "document" if current == "video" else "video"
+        user_data = await db.get_user_data(user_id)
+        current = user_data.get("upload_mode", "video")
+        new_mode = "document" if current == "video" else "video"
+        await db.set_upload_mode(user_id, new_mode)
         await show_settings(query)
 
     elif data == "set_metadata":
         await query.message.edit_text("Send your custom metadata title as a text reply now.")
-        USER_DATA[user_id]["awaiting_meta"] = True
+        TEMP_DATA.setdefault(user_id, {})["awaiting_meta"] = True
 
     elif data == "view_thumb":
-        thumb_path = f"./THUMBS/{user_id}.jpg"
-        if os.path.exists(thumb_path):
-            await query.message.reply_photo(photo=thumb_path, caption="Your Saved Thumbnail")
+        user_data = await db.get_user_data(user_id)
+        thumb_id = user_data.get("thumbnail")
+        if thumb_id:
+            await query.message.reply_photo(photo=thumb_id, caption="Your Saved Thumbnail")
         else:
-            await query.answer("❌ No thumbnail found!", show_alert=True)
+            await query.answer("❌ No thumbnail found in Database!", show_alert=True)
 
     elif data == "del_thumb":
-        thumb_path = f"./THUMBS/{user_id}.jpg"
-        if os.path.exists(thumb_path):
-            os.remove(thumb_path)
-            await query.answer("🗑️ Thumbnail Deleted!", show_alert=True)
-        else:
-            await query.answer("❌ No thumbnail found!", show_alert=True)
+        await db.delete_thumbnail(user_id)
+        await query.answer("🗑️ Thumbnail Deleted from Database!", show_alert=True)
 
     elif data == "act_cancel":
         await query.message.delete()
 
     elif data == "act_rename":
         await query.message.edit_text("📝 **Send me the new file name (with extension):**")
-        USER_DATA[user_id]["awaiting_rename"] = True
+        TEMP_DATA.setdefault(user_id, {})["awaiting_rename"] = True
 
     elif data in ["act_extract", "act_remove"]:
-        msg = USER_DATA[user_id].get("current_file")
+        msg = TEMP_DATA.get(user_id, {}).get("current_file")
         if not msg:
             await query.answer("Expired session!", show_alert=True)
             return
         
         status = await query.message.edit_text("⏳ **Downloading media to inspect streams...**")
         file_path = await msg.download(file_name=f"{Config.DOWNLOAD_LOCATION}/{user_id}_temp")
-        USER_DATA[user_id]["temp_file"] = file_path
+        TEMP_DATA[user_id]["temp_file"] = file_path
         
         streams = get_streams_info(file_path)
         if not streams:
@@ -211,7 +208,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
         parts = data.split("_")
         action = parts[1]
         stream_idx = int(parts[2])
-        file_path = USER_DATA[user_id].get("temp_file")
+        file_path = TEMP_DATA.get(user_id, {}).get("temp_file")
 
         if not file_path or not os.path.exists(file_path):
             await query.answer("File session expired!", show_alert=True)
@@ -242,18 +239,17 @@ async def callback_handler(client: Client, query: CallbackQuery):
 @bot.on_message(filters.text & filters.private & ~filters.command(["start", "settings"]))
 async def text_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    USER_DATA.setdefault(user_id, {"upload_mode": "video", "metadata": "Renamed By Advanced Bot"})
 
-    if USER_DATA[user_id].get("awaiting_meta"):
-        USER_DATA[user_id]["metadata"] = message.text
-        USER_DATA[user_id]["awaiting_meta"] = False
-        await message.reply_text(f"✅ **Metadata updated to:** `{message.text}`")
+    if TEMP_DATA.get(user_id, {}).get("awaiting_meta"):
+        await db.set_metadata(user_id, message.text)
+        TEMP_DATA[user_id]["awaiting_meta"] = False
+        await message.reply_text(f"✅ **Metadata updated in DB to:** `{message.text}`")
         return
 
-    if USER_DATA[user_id].get("awaiting_rename"):
-        USER_DATA[user_id]["awaiting_rename"] = False
+    if TEMP_DATA.get(user_id, {}).get("awaiting_rename"):
+        TEMP_DATA[user_id]["awaiting_rename"] = False
         new_name = message.text
-        msg = USER_DATA[user_id].get("current_file")
+        msg = TEMP_DATA.get(user_id, {}).get("current_file")
 
         if not msg:
             await message.reply_text("❌ No active file found to rename!")
@@ -262,8 +258,10 @@ async def text_handler(client: Client, message: Message):
         status = await message.reply_text("⏳ **Downloading file...**")
         download_path = await msg.download(file_name=f"{Config.DOWNLOAD_LOCATION}/{new_name}")
         
-        # Apply Metadata Title via FFmpeg
-        meta_title = USER_DATA[user_id]["metadata"]
+        # Apply Metadata Title via FFmpeg from Database
+        user_data = await db.get_user_data(user_id)
+        meta_title = user_data.get("metadata", "Renamed By Advanced Bot")
+        
         meta_output = f"{download_path}_meta.mp4"
         cmd = [
             "ffmpeg", "-y", "-i", download_path,
@@ -284,9 +282,18 @@ async def text_handler(client: Client, message: Message):
 # --- UPLOAD HELPER ---
 
 async def upload_processed_file(client, status_msg, user_id, file_path, file_name):
-    mode = USER_DATA[user_id]["upload_mode"]
-    thumb_path = f"./THUMBS/{user_id}.jpg"
-    thumb = thumb_path if os.path.exists(thumb_path) else None
+    user_data = await db.get_user_data(user_id)
+    mode = user_data.get("upload_mode", "video")
+    thumb_id = user_data.get("thumbnail")
+    
+    # Download thumbnail locally if exists in DB
+    thumb_path = None
+    if thumb_id:
+        try:
+            thumb_path = await client.download_media(thumb_id, file_name=f"./THUMBS/{user_id}.jpg")
+        except Exception:
+            thumb_path = None
+
     duration = get_media_duration(file_path)
 
     if mode == "video":
@@ -294,7 +301,7 @@ async def upload_processed_file(client, status_msg, user_id, file_path, file_nam
             chat_id=user_id,
             video=file_path,
             caption=f"**File Name:** `{file_name}`",
-            thumb=thumb,
+            thumb=thumb_path,
             duration=duration,
             file_name=file_name
         )
@@ -303,13 +310,17 @@ async def upload_processed_file(client, status_msg, user_id, file_path, file_nam
             chat_id=user_id,
             document=file_path,
             caption=f"**File Name:** `{file_name}`",
-            thumb=thumb,
+            thumb=thumb_path,
             file_name=file_name
         )
+
+    if thumb_path and os.path.exists(thumb_path):
+        os.remove(thumb_path)
 
     await status_msg.delete()
 
 # Run Bot
 if __name__ == "__main__":
     bot.run()
-  
+    
+        
