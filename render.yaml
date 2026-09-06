@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: telegram-renamer-bot
+    env: docker
+    plan: free
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN
+        sync: false
+        
